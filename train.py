@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 import torchvision.utils
 from torch.nn.parallel import DistributedDataParallel as NativeDDP
+import numpy as np
 
 from timm.data import create_dataset, create_loader, resolve_data_config, Mixup, FastCollateMixup, AugMixDataset
 from timm.models import create_model, safe_model_name, resume_checkpoint, load_checkpoint,\
@@ -73,6 +74,7 @@ parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 # Dataset / Model parameters
 parser.add_argument('data_dir', metavar='DIR',
                     help='path to dataset')
+# parser.add_argument('data_dir', type=str, default='/home/data/imagenet/')
 parser.add_argument('--dataset', '-d', metavar='NAME', default='',
                     help='dataset type (default: ImageFolder/ImageTar if empty)')
 parser.add_argument('--train-split', metavar='NAME', default='train',
@@ -216,6 +218,16 @@ parser.add_argument('--drop-path', type=float, default=None, metavar='PCT',
                     help='Drop path rate (default: None)')
 parser.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                     help='Drop block rate (default: None)')
+
+
+# moex
+parser.add_argument('--moex_prob', default=0., type=float, help='MoEx probability')
+parser.add_argument('--moex_lam', default=0.9, type=float, help='MoEx lambda')
+parser.add_argument('--moex_layer', default='stem', type=str, help='MoEx layer')
+parser.add_argument('--moex_epsilon', default=1e-5, type=float, help='MoEx epsilon')
+parser.add_argument('--moex_norm', default='pono', type=str, help='MoEx norm type')
+parser.add_argument('--moex_positive_only', action='store_true', help='MoEx positive only')
+
 
 # Batch norm parameters (only works with gen_efficientnet based models currently)
 parser.add_argument('--bn-tf', action='store_true', default=False,
@@ -654,8 +666,23 @@ def train_one_epoch(
             input = input.contiguous(memory_format=torch.channels_last)
 
         with amp_autocast():
-            output = model(input)
-            loss = loss_fn(output, target)
+            # output = model(input)
+            # loss = loss_fn(output, target)
+            if torch.rand(1).item() < args.moex_prob:
+                swap_index = torch.randperm(input.size(0), device=input.device)
+                with torch.no_grad():
+                    target_a = target
+                    target_b = target[swap_index]
+                output = model(input, swap_index=swap_index, moex_epsilon=args.moex_epsilon,
+                            moex_norm=args.moex_norm, moex_layer=args.moex_layer,
+                            moex_positive_only=args.moex_positive_only)
+                lam = args.moex_lam
+                loss = loss_fn(output, target_a) * lam + loss_fn(output, target_b) * (1. - lam)
+            else:
+                # compute output
+                output = model(input)
+                loss = loss_fn(output, target)
+        
 
         if not args.distributed:
             losses_m.update(loss.item(), input.size(0))
