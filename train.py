@@ -668,20 +668,42 @@ def train_one_epoch(
         with amp_autocast():
             # output = model(input)
             # loss = loss_fn(output, target)
+            cutmix_lam = np.random.beta(1.0, 1.0)
+            with torch.no_grad():
+                swap_index = torch.randperm(input.size()[0]).cuda()
+                target_a = target
+                target_b = target[swap_index]
+                bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), cutmix_lam)
+                input[:, :, bbx1:bbx2, bby1:bby2] = input[swap_index, :, bbx1:bbx2, bby1:bby2]
+                # adjust lambda to exactly match pixel ratio
+                cutmix_lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
+                target_for_acc = target_a if cutmix_lam >= 0.5 else target_b
             if torch.rand(1).item() < args.moex_prob:
-                swap_index = torch.randperm(input.size(0), device=input.device)
                 with torch.no_grad():
-                    target_a = target
-                    target_b = target[swap_index]
+                    target_c = target_b[swap_index]
                 output = model(input, swap_index=swap_index, moex_epsilon=args.moex_epsilon,
-                            moex_norm=args.moex_norm, moex_layer=args.moex_layer,
-                            moex_positive_only=args.moex_positive_only)
+                               moex_norm=args.moex_norm, moex_layer=args.moex_layer,
+                               moex_positive_only=args.moex_positive_only)
                 lam = args.moex_lam
                 loss = loss_fn(output, target_a) * lam + loss_fn(output, target_b) * (1. - lam)
+                if torch.is_tensor(cutmix_lam):
+                    loss = (loss_fn(output, target_a, reduction='none') * cutmix_lam * lam).mean() \
+                           + (loss_fn(output, target_b, reduction='none') * (
+                                (1. - cutmix_lam) * lam + cutmix_lam * (1. - lam))).mean() \
+                           + (loss_fn(output, target_c, reduction='none') * (1. - cutmix_lam) * (1 - lam)).mean()
+                else:
+                    loss = loss_fn(output, target_a) * cutmix_lam * lam \
+                           + loss_fn(output, target_b) * ((1. - cutmix_lam) * lam + cutmix_lam * (1. - lam)) \
+                           + loss_fn(output, target_c) * (1. - cutmix_lam) * (1 - lam)
             else:
                 # compute output
                 output = model(input)
-                loss = loss_fn(output, target)
+                if torch.is_tensor(cutmix_lam):
+                    loss = (loss_fn(output, target_a, reduction='none') * cutmix_lam).mean() + (
+                                loss_fn(output, target_b, reduction='none') * (1. - cutmix_lam)).mean()
+                else:
+                    loss = loss_fn(output, target_a) * cutmix_lam + loss_fn(output, target_b) * (1. - cutmix_lam)
+
         
 
         if not args.distributed:
@@ -820,6 +842,23 @@ def validate(model, loader, loss_fn, args, amp_autocast=suppress, log_suffix='')
 
     return metrics
 
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = np.int(W * cut_rat)
+    cut_h = np.int(H * cut_rat)
+
+    # uniform
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+
+    return bbx1, bby1, bbx2, bby2
 
 if __name__ == '__main__':
     main()
